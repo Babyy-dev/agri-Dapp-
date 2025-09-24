@@ -1,9 +1,23 @@
 import { CollectionEvent, ProcessingStep, QualityTest, Provenance, SmartContractRule } from '../types/blockchain';
+import { DatabaseService } from './DatabaseService';
+import { database } from '../config/database';
 
 export class BlockchainService {
   private static transactions: any[] = [];
 
-  static logTransaction(type: string, data: any) {
+  // Initialize database connection
+  static async initialize() {
+    try {
+      if (!database.isDBConnected()) {
+        await database.connect();
+      }
+    } catch (error) {
+      console.error('❌ Failed to initialize BlockchainService:', error);
+      throw error;
+    }
+  }
+
+  static async logTransaction(type: string, data: any) {
     const transaction = {
       id: `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       type,
@@ -29,7 +43,19 @@ export class BlockchainService {
     return `0x${Math.abs(hash).toString(16).padStart(8, '0')}`;
   }
 
-  static getSmartContractRules(): SmartContractRule[] {
+  static async getSmartContractRules(): Promise<SmartContractRule[]> {
+    try {
+      await this.initialize();
+      const rules = await DatabaseService.getSmartContractRules({ active: true });
+      return rules as SmartContractRule[];
+    } catch (error) {
+      console.error('Error fetching smart contract rules:', error);
+      // Fallback to hardcoded rules if database fails
+      return this.getFallbackRules();
+    }
+  }
+
+  private static getFallbackRules(): SmartContractRule[] {
     return [
       {
         id: 'ashwagandha-geo-fence',
@@ -79,37 +105,45 @@ export class BlockchainService {
     ];
   }
 
-  static validateHarvesting(event: CollectionEvent, rules: SmartContractRule[]): boolean {
-    const speciesRules = rules.filter(rule => rule.species === event.species && rule.active);
-    
-    for (const rule of speciesRules) {
-      switch (rule.type) {
-        case 'geo_fence':
-          if (!this.validateGeoFence(event.lat, event.lng, rule.parameters.allowedZones)) {
-            console.log('❌ Geo-fence validation failed');
-            return false;
-          }
-          break;
-          
-        case 'seasonal':
-          const month = new Date(event.timestamp).getMonth() + 1;
-          if (!rule.parameters.harvestingMonths.includes(month)) {
-            console.log('❌ Seasonal restriction violated');
-            return false;
-          }
-          break;
-          
-        case 'quality':
-          if (event.initialQualityMetrics.moisture > rule.parameters.maxMoisture) {
-            console.log('❌ Quality threshold exceeded');
-            return false;
-          }
-          break;
+  static async validateHarvesting(event: CollectionEvent, rules?: SmartContractRule[]): Promise<boolean> {
+    try {
+      if (!rules) {
+        rules = await this.getSmartContractRules();
       }
+      const speciesRules = rules.filter(rule => rule.species === event.species && rule.active);
+      
+      for (const rule of speciesRules) {
+        switch (rule.type) {
+          case 'geo_fence':
+            if (!this.validateGeoFence(event.lat, event.lng, rule.parameters.allowedZones)) {
+              console.log('❌ Geo-fence validation failed');
+              return false;
+            }
+            break;
+            
+          case 'seasonal':
+            const month = new Date(event.timestamp).getMonth() + 1;
+            if (!rule.parameters.harvestingMonths.includes(month)) {
+              console.log('❌ Seasonal restriction violated');
+              return false;
+            }
+            break;
+            
+          case 'quality':
+            if (event.initialQualityMetrics.moisture > rule.parameters.maxMoisture) {
+              console.log('❌ Quality threshold exceeded');
+              return false;
+            }
+            break;
+        }
+      }
+      
+      console.log('✅ Smart contract validation passed');
+      return true;
+    } catch (error) {
+      console.error('Error validating harvesting:', error);
+      return false;
     }
-    
-    console.log('✅ Smart contract validation passed');
-    return true;
   }
 
   private static validateGeoFence(lat: number, lng: number, allowedZones: any[]): boolean {
@@ -119,84 +153,124 @@ export class BlockchainService {
     });
   }
 
-  static generateProvenance(
+  static async generateProvenance(
     batchId: string, 
-    collections: CollectionEvent[], 
-    processing: ProcessingStep[], 
-    tests: QualityTest[]
-  ): Provenance {
-    const batchCollections = collections.filter(c => c.batchId === batchId);
-    const batchProcessing = processing.filter(p => p.batchId === batchId);
-    const batchTests = tests.filter(t => t.batchId === batchId);
-
-    const chainOfCustody = [
-      ...batchCollections.map(c => ({
-        organizationId: c.collectorId,
-        timestamp: c.timestamp,
-        action: `Harvested ${c.species}`,
-        location: { lat: c.lat, lng: c.lng }
-      })),
-      ...batchProcessing.map(p => ({
-        organizationId: p.processorId,
-        timestamp: p.timestamp,
-        action: `Processing: ${p.stepType}`,
-        location: { lat: 26.5, lng: 74.5 } // Mock processor location
-      })),
-      ...batchTests.map(t => ({
-        organizationId: t.labId,
-        timestamp: t.timestamp,
-        action: `Quality test: ${t.testType}`,
-        location: { lat: 28.6, lng: 77.2 } // Mock lab location
-      }))
-    ].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-    return {
-      batchId,
-      chainOfCustody,
-      sustainabilityProofs: [
-        {
-          type: 'organic',
-          certificateId: 'ORG-2024-001',
-          issuedBy: 'India Organic Certification Agency',
-          validUntil: '2025-12-31'
-        },
-        {
-          type: 'sustainable_harvest',
-          certificateId: 'SH-2024-001',
-          issuedBy: 'Forest Conservation Council',
-          validUntil: '2025-06-30'
-        }
-      ],
-      finalProduct: {
-        qrCode: this.generateQRCode(batchId),
-        productName: 'Premium Ashwagandha Root Powder',
-        manufacturerId: 'manufacturer-1',
-        batchSize: 50,
-        expiryDate: '2026-12-31'
+    collections?: CollectionEvent[], 
+    processing?: ProcessingStep[], 
+    tests?: QualityTest[]
+  ): Promise<Provenance> {
+    try {
+      await this.initialize();
+      
+      // Fetch data from database if not provided
+      if (!collections) {
+        collections = await DatabaseService.getCollectionEventsByBatch(batchId) as CollectionEvent[];
       }
-    };
+      if (!processing) {
+        processing = await DatabaseService.getProcessingStepsByBatch(batchId) as ProcessingStep[];
+      }
+      if (!tests) {
+        tests = await DatabaseService.getQualityTestsByBatch(batchId) as QualityTest[];
+      }
+      const batchCollections = collections.filter(c => c.batchId === batchId);
+      const batchProcessing = processing.filter(p => p.batchId === batchId);
+      const batchTests = tests.filter(t => t.batchId === batchId);
+
+      const chainOfCustody = [
+        ...batchCollections.map(c => ({
+          organizationId: c.collectorId,
+          timestamp: c.timestamp,
+          action: `Harvested ${c.species}`,
+          location: { lat: c.lat, lng: c.lng }
+        })),
+        ...batchProcessing.map(p => ({
+          organizationId: p.processorId,
+          timestamp: p.timestamp,
+          action: `Processing: ${p.stepType}`,
+          location: { lat: 26.5, lng: 74.5 } // Mock processor location
+        })),
+        ...batchTests.map(t => ({
+          organizationId: t.labId,
+          timestamp: t.timestamp,
+          action: `Quality test: ${t.testType}`,
+          location: { lat: 28.6, lng: 77.2 } // Mock lab location
+        }))
+      ].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+      const provenance: Provenance = {
+        batchId,
+        chainOfCustody,
+        sustainabilityProofs: [
+          {
+            type: 'organic',
+            certificateId: 'ORG-2024-001',
+            issuedBy: 'India Organic Certification Agency',
+            validUntil: '2025-12-31'
+          },
+          {
+            type: 'sustainable_harvest',
+            certificateId: 'SH-2024-001',
+            issuedBy: 'Forest Conservation Council',
+            validUntil: '2025-06-30'
+          }
+        ],
+        finalProduct: {
+          qrCode: this.generateQRCode(batchId),
+          productName: 'Premium Ashwagandha Root Powder',
+          manufacturerId: 'manufacturer-1',
+          batchSize: 50,
+          expiryDate: '2026-12-31'
+        }
+      };
+      
+      // Store provenance in database
+      await DatabaseService.createProvenance(provenance);
+      return provenance;
+    } catch (error) {
+      console.error('Error generating provenance:', error);
+      throw error;
+    }
   }
 
   static generateQRCode(batchId: string): string {
     return `QR_${batchId}_${Date.now()}`;
   }
 
-  static getBatchHistory(
-    batchId: string, 
-    collections: CollectionEvent[], 
-    processing: ProcessingStep[], 
-    tests: QualityTest[]
-  ) {
-    const events = [
-      ...collections.filter(c => c.batchId === batchId).map(c => ({ ...c, type: 'collection' })),
-      ...processing.filter(p => p.batchId === batchId).map(p => ({ ...p, type: 'processing' })),
-      ...tests.filter(t => t.batchId === batchId).map(t => ({ ...t, type: 'testing' }))
-    ].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-    return events;
+  static async getBatchHistory(batchId: string): Promise<any[]> {
+    try {
+      await this.initialize();
+      return await DatabaseService.getBatchHistory(batchId);
+    } catch (error) {
+      console.error('Error fetching batch history:', error);
+      return [];
+    }
   }
 
-  static getDemoData() {
+  static async getDemoData() {
+    try {
+      await this.initialize();
+      
+      // Try to fetch from database first
+      const [collectionEvents, processingSteps, qualityTests, provenance] = await Promise.all([
+        DatabaseService.getCollectionEvents(),
+        DatabaseService.getProcessingSteps(),
+        DatabaseService.getQualityTests(),
+        DatabaseService.getSmartContractRules()
+      ]);
+      
+      if (collectionEvents.length > 0) {
+        return {
+          collectionEvents: collectionEvents as CollectionEvent[],
+          processingSteps: processingSteps as ProcessingStep[],
+          qualityTests: qualityTests as QualityTest[],
+          provenance: [] // Will be populated when needed
+        };
+      }
+    } catch (error) {
+      console.error('Error fetching data from database, using fallback:', error);
+    }
+    
+    // Fallback to hardcoded demo data
     const demoCollectionEvents: CollectionEvent[] = [
       {
         batchId: 'ASH-2024-001',
